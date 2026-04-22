@@ -1,7 +1,8 @@
 """
-Estuda Ai - Backend FastAPI v2.0
+Estuda Ai - Backend FastAPI v2.1
 Tutor escolar com IA que guia sem entregar respostas.
-Features: rate limiting, deteccao de materia, escalada adaptativa, exercicios de pratica.
+Features: rate limiting, deteccao de materia, escalada adaptativa, exercicios de pratica,
+contas opcionais (nome + PIN).
 """
 
 import os
@@ -9,13 +10,19 @@ import json
 import time
 import httpx
 from collections import defaultdict
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
-app = FastAPI(title="Estuda Ai API", version="2.0.0")
+import db
+import auth
+
+app = FastAPI(title="Estuda Ai API", version="2.1.0")
+
+# Initialize database on startup
+db.init_db()
 
 # CORS
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -258,6 +265,46 @@ class PracticeRequest(BaseModel):
     modo_mestre: bool = False
 
 
+class RegisterRequest(BaseModel):
+    nome: str = Field(min_length=2, max_length=30)
+    pin: str = Field(min_length=4, max_length=4)
+    ano: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    nome: str = Field(min_length=2, max_length=30)
+    pin: str = Field(min_length=4, max_length=4)
+
+
+class StatsData(BaseModel):
+    totalXP: int = 0
+    streak: int = 0
+    lastStudyDate: Optional[str] = None
+    badges: list[str] = []
+    subjectCounts: dict = {}
+    totalSessions: int = 0
+    totalMessages: int = 0
+    totalPractice: int = 0
+    totalUnderstood: int = 0
+
+
+# ──────────────────────────────────────────────
+# Auth dependency
+# ──────────────────────────────────────────────
+
+
+async def get_current_user(request: Request) -> dict:
+    """Extract and verify user from Authorization header."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Nao autenticado")
+    token = auth_header[7:]
+    payload = auth.verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token invalido ou expirado")
+    return payload
+
+
 # ──────────────────────────────────────────────
 # Streaming helper
 # ──────────────────────────────────────────────
@@ -320,7 +367,7 @@ def build_streaming_response(generator, remaining: int) -> StreamingResponse:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "estuda-ai", "version": "2.0.0"}
+    return {"status": "ok", "service": "estuda-ai", "version": "2.1.0"}
 
 
 @app.post("/chat")
@@ -378,6 +425,80 @@ async def practice(req: PracticeRequest, request: Request):
     return build_streaming_response(
         stream_anthropic(system_prompt, api_messages), remaining
     )
+
+
+# ──────────────────────────────────────────────
+# Auth routes
+# ──────────────────────────────────────────────
+
+
+@app.post("/auth/register")
+async def register(req: RegisterRequest, request: Request):
+    """Create a new user account."""
+    check_rate_limit(request)
+
+    nome = req.nome.strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="Nome invalido")
+
+    if not req.pin.isdigit():
+        raise HTTPException(status_code=400, detail="PIN deve conter apenas numeros")
+
+    if db.user_exists(nome):
+        raise HTTPException(status_code=409, detail="Ja existe uma conta com esse nome")
+
+    pin_hash = auth.hash_pin(req.pin)
+    user_id = db.create_user(nome, pin_hash, req.ano)
+    token = auth.create_token(user_id, nome)
+
+    return {
+        "token": token,
+        "user": {"id": user_id, "nome": nome, "ano": req.ano},
+    }
+
+
+@app.post("/auth/login")
+async def login(req: LoginRequest, request: Request):
+    """Login with name + PIN."""
+    check_rate_limit(request)
+
+    nome = req.nome.strip()
+    user = db.get_user_by_nome(nome)
+    if not user or not auth.verify_pin(req.pin, user["pin_hash"]):
+        raise HTTPException(status_code=401, detail="Nome ou PIN incorretos")
+
+    token = auth.create_token(user["id"], user["nome"])
+    return {
+        "token": token,
+        "user": {"id": user["id"], "nome": user["nome"], "ano": user["ano"]},
+    }
+
+
+@app.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    """Get current user info."""
+    user_data = db.get_user_by_id(user["sub"])
+    if not user_data:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+    return user_data
+
+
+# ──────────────────────────────────────────────
+# Stats routes
+# ──────────────────────────────────────────────
+
+
+@app.get("/stats")
+async def get_stats(user: dict = Depends(get_current_user)):
+    """Get gamification stats for the logged-in user."""
+    return db.get_stats(user["sub"])
+
+
+@app.post("/stats/sync")
+async def sync_stats(stats: StatsData, user: dict = Depends(get_current_user)):
+    """Save gamification stats for the logged-in user."""
+    db.save_stats(user["sub"], stats.model_dump())
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
